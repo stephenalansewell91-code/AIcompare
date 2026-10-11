@@ -229,7 +229,8 @@ final class App: NSObject, NSApplicationDelegate {
         let hint = NSTextField(labelWithString: "⌘ Return to send • Use each panel to choose its model or start a new chat"); hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 11)
         let footer = NSStackView(views: [sendButton, hint]); footer.spacing = 12; stack.addArrangedSubview(footer)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        for pane in panes.prefix(showClaude.state == .on ? 3 : 2) { pane.start() }
+        if restoring { verifyPersistedCookie() }
+        else { for pane in panes.prefix(showClaude.state == .on ? 3 : 2) { pane.start() } }
         if testing || restoring { DispatchQueue.main.asyncAfter(deadline: .now() + 25) { print("Integration test timed out"); exit(1) } }
     }
     func setupMenu() {
@@ -272,13 +273,6 @@ final class App: NSObject, NSApplicationDelegate {
     func pageLoaded(_ id: String) {
         guard testing || restoring else { return }
         loaded.insert(id); guard loaded.count == 2 else { return }
-        if restoring {
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                guard let cookie = cookies.first(where: { $0.name == "AIComparePersistenceTest" && $0.value == "saved" }) else { print("Persistent cookie missing after restart"); exit(1) }
-                WKWebsiteDataStore.default().httpCookieStore.delete(cookie) { print("Persistent cookie survived app restart"); NSApp.terminate(nil) }
-            }
-            return
-        }
         let text = "A shared prompt\nwith quotes: \"hello\" and unicode ✓"
         prompt.string = text
         var remaining = 2
@@ -290,6 +284,15 @@ final class App: NSObject, NSApplicationDelegate {
                     remaining -= 1; if remaining == 0 { self.finishTests() }
                 }
             }
+        }
+    }
+    func verifyPersistedCookie() {
+        print("Checking saved cookie in a fresh process")
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            guard let cookie = cookies.first(where: { $0.name == "AIComparePersistenceTest" && $0.value == "saved" }) else { print("Persistent cookie missing after restart"); exit(1) }
+            print("Persistent cookie survived app restart")
+            WKWebsiteDataStore.default().httpCookieStore.delete(cookie)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NSApp.terminate(nil) }
         }
     }
     func finishTests() {
