@@ -1,5 +1,6 @@
 import Cocoa
 import WebKit
+import Security
 
 struct Provider {
     let id: String
@@ -17,6 +18,64 @@ func jsonLiteral(_ value: String) -> String {
 }
 let testing = CommandLine.arguments.contains("--integration-test")
 let restoring = CommandLine.arguments.contains("--verify-persistence")
+
+final class SessionVault: NSObject, WKHTTPCookieStoreObserver {
+    let cookies = WKWebsiteDataStore.default().httpCookieStore
+    let service = "com.aicompare.desktop.cookies" + ((testing || restoring) ? ".test" : "")
+    var ready = false
+    var pendingSave: DispatchWorkItem?
+    var onError: ((String) -> Void)?
+    var query: [String: Any] { [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: "embedded-sessions"] }
+    func restore(_ completion: @escaping () -> Void) {
+        var request = query; request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(request as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data,
+              let records = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [[String: Any]] else {
+            if status != errSecItemNotFound && status != errSecSuccess { onError?("Keychain session restore failed (\(status)).") }
+            begin(); completion(); return
+        }
+        let restored = records.compactMap { record -> HTTPCookie? in
+            let properties = Dictionary(uniqueKeysWithValues: record.map { (HTTPCookiePropertyKey($0.key), $0.value) })
+            guard let cookie = HTTPCookie(properties: properties), cookie.expiresDate.map({ $0 > Date() }) ?? true else { return nil }
+            return cookie
+        }
+        let group = DispatchGroup()
+        for cookie in restored { group.enter(); cookies.setCookie(cookie) { group.leave() } }
+        group.notify(queue: .main) { self.begin(); completion() }
+    }
+    func begin() { ready = true; cookies.add(self) }
+    func cookiesDidChange(in cookieStore: WKHTTPCookieStore) {
+        guard ready else { return }
+        pendingSave?.cancel()
+        let work = DispatchWorkItem { self.save { _ in } }; pendingSave = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+    func save(_ completion: @escaping (Bool) -> Void) {
+        pendingSave?.cancel()
+        cookies.getAllCookies { cookies in
+            let records: [[String: Any]] = cookies.compactMap { cookie in
+                guard let properties = cookie.properties else { return nil }
+                return Dictionary(uniqueKeysWithValues: properties.compactMap { key, value in
+                    // Cookie properties are plist scalar values on supported macOS versions.
+                    if value is String || value is NSNumber || value is Date { return (key.rawValue, value) }
+                    return nil
+                })
+            }
+            do {
+                let data = try PropertyListSerialization.data(fromPropertyList: records, format: .binary, options: 0)
+                var status = SecItemUpdate(self.query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+                if status == errSecItemNotFound {
+                    var item = self.query; item[kSecValueData as String] = data
+                    item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                    status = SecItemAdd(item as CFDictionary, nil)
+                }
+                if status != errSecSuccess { self.onError?("Keychain session save failed (\(status)).") }
+                completion(status == errSecSuccess)
+            } catch { self.onError?(error.localizedDescription); completion(false) }
+        }
+    }
+}
 
 final class Fixture: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
@@ -194,6 +253,7 @@ final class App: NSObject, NSApplicationDelegate {
     let sendButton = NSButton(title: "Send to both AIs", target: nil, action: nil)
     let summary = NSTextField(labelWithString: "Sign in once in each panel. Your sessions are saved on this Mac.")
     let showClaude = NSButton(checkboxWithTitle: "Show Claude", target: nil, action: nil)
+    let vault = SessionVault()
     var sending = false
     var loaded = Set<String>()
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -229,8 +289,11 @@ final class App: NSObject, NSApplicationDelegate {
         let hint = NSTextField(labelWithString: "⌘ Return to send • Use each panel to choose its model or start a new chat"); hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 11)
         let footer = NSStackView(views: [sendButton, hint]); footer.spacing = 12; stack.addArrangedSubview(footer)
         window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        if restoring { verifyPersistedCookie() }
-        else { for pane in panes.prefix(showClaude.state == .on ? 3 : 2) { pane.start() } }
+        vault.onError = { [weak self] message in self?.summary.stringValue = message }
+        vault.restore {
+            if restoring { self.verifyPersistedCookie() }
+            else { for pane in self.panes.prefix(self.showClaude.state == .on ? 3 : 2) { pane.start() } }
+        }
         if testing || restoring { DispatchQueue.main.asyncAfter(deadline: .now() + 25) { print("Integration test timed out"); exit(1) } }
     }
     func setupMenu() {
@@ -269,6 +332,14 @@ final class App: NSObject, NSApplicationDelegate {
             }
         }
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard vault.ready else { return .terminateNow }
+        vault.save { success in
+            if (testing || restoring) && !success { print("Session save failed"); exit(1) }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func pageLoaded(_ id: String) {
         guard testing || restoring else { return }
@@ -291,8 +362,7 @@ final class App: NSObject, NSApplicationDelegate {
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             guard let cookie = cookies.first(where: { $0.name == "AIComparePersistenceTest" && $0.value == "saved" }) else { print("Persistent cookie missing after restart"); exit(1) }
             print("Persistent cookie survived app restart")
-            WKWebsiteDataStore.default().httpCookieStore.delete(cookie)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NSApp.terminate(nil) }
+            WKWebsiteDataStore.default().httpCookieStore.delete(cookie) { NSApp.terminate(nil) }
         }
     }
     func finishTests() {

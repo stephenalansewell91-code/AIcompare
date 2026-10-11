@@ -1,6 +1,8 @@
 # AI Compare — in-app sessions
 
-Native Apple Silicon macOS app with ChatGPT and Gemini running directly in embedded WebKit panels. An optional third panel supports Claude. Sign in inside each panel once; the app keeps cookies and website storage on your Mac and reopens your last chat URLs. The shared prompt is submitted to the selected panels, where replies stream through each provider's normal interface.
+Native Apple Silicon macOS app with ChatGPT and Gemini running directly in embedded WebKit panels. An optional third panel supports Claude. Sign in inside each panel once; the app keeps website storage on your Mac and saves session cookies in macOS Keychain and reopens your last chat URLs. The shared prompt is submitted to the selected panels, where replies stream through each provider's normal interface.
+
+Keychain may ask permission when an updated locally signed build accesses saved sessions. Allow access for AI Compare to restore them.
 
 No Chrome, Apple Events, external browser, API keys, or proxy service is used. Login popups open as additional windows inside AI Compare and share its persistent website store. Model selection, chat history, and file selection are handled by each provider's own UI.
 

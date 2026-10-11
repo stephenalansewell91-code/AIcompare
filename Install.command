@@ -11,7 +11,7 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
 fi
 app_dir="$HOME/Applications/AI Compare.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
-xcrun swiftc -swift-version 5 -O -target arm64-apple-macos13.0 Sources/main.swift -framework Cocoa -framework WebKit -o "$app_dir/Contents/MacOS/AICompare"
+xcrun swiftc -swift-version 5 -O -target arm64-apple-macos13.0 Sources/main.swift -framework Cocoa -framework WebKit -framework Security -o "$app_dir/Contents/MacOS/AICompare"
 cp Sources/adapter.js "$app_dir/Contents/Resources/"
 cp Info.plist "$app_dir/Contents/Info.plist"
 codesign --force --sign - --identifier com.aicompare.desktop "$app_dir"
