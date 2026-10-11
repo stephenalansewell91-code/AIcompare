@@ -1,44 +1,28 @@
-# AI Compare for Apple Silicon
+# AI Compare — in-app sessions
 
-A native macOS application that sends one prompt to selected ChatGPT, Gemini, and Claude browser sessions and displays their replies in three comparison panels. Uses your normal Chrome logins and subscriptions; no API keys, extra service, or app-owned credential store.
+Native Apple Silicon macOS app with ChatGPT and Gemini running directly in embedded WebKit panels. An optional third panel supports Claude. Sign in inside each panel once; the app keeps cookies and website storage on your Mac and reopens your last chat URLs. The shared prompt is submitted to the selected panels, where replies stream through each provider's normal interface.
 
-## Download
+No Chrome, Apple Events, external browser, API keys, or proxy service is used. Login popups open as additional windows inside AI Compare and share its persistent website store. Model selection, chat history, and file selection are handled by each provider's own UI.
 
-A compiled Apple Silicon app and DMG are produced by the GitHub Actions build. Download the AICompare-AppleSilicon artifact from a successful run. Open the DMG and drag AI Compare to Applications. The app is locally signed but not Apple-notarized; macOS may require Open Anyway in Privacy & Security on first launch. Google Chrome is required.
+## Install the compiled app
 
-## Build from source
+Requires macOS 13+ on Apple Silicon. Download the DMG from the successful GitHub Actions build, open it, and drag AI Compare to Applications. Quit and replace the previous version before launching. This build is locally signed and not Apple-notarized; if macOS blocks it, use Privacy & Security → Open Anyway after attempting to open it.
 
-Requires an Apple Silicon Mac, macOS 13 or later, Google Chrome, and Apple Command Line Tools. This package contains source and a local installer, not a precompiled or notarized app.
+1. Sign into ChatGPT and Gemini inside the app's panels.
+2. Leave the checkboxes enabled for services you want to query.
+3. Enter a prompt in the bottom box and click Send, or press Command-Return.
+4. Read and interact with each response directly in its panel.
 
-1. Unzip this folder on your Mac.
-2. Double-click `Install.command`. If macOS prevents opening the downloaded script, open Terminal, type `bash `, drag `Install.command` into Terminal, and press Return. Review the source before running.
-3. If prompted to install Command Line Tools, finish their installation and run the installer again.
-4. The installer compiles ARM64 code, signs it locally, installs `AI Compare.app` in your user Applications folder, and opens it.
-5. Select providers, then click **Open / reconnect sessions**. Sign in directly in Chrome.
-6. In Chrome, turn on **View → Developer → Allow JavaScript from Apple Events**. Approve the app's request to control Chrome. If necessary, check macOS System Settings → Privacy & Security → Automation.
-7. Write your prompt in AI Compare and click **Send to selected AIs** or press Command-Return.
+Home returns to the provider's homepage. Reload refreshes its page. Show Claude adds a third embedded session. Signing out on a provider's page signs that provider out of the app. Cookies are shared across the app's embedded windows, which allows Google-based authentication popups to use the same session store.
 
-Chrome remains visible and handles all login, model selection, attachments, and chat history. The app finds an existing tab for each service or creates one. If multiple tabs exist for a provider, it uses the first matching tab; keep one active comparison tab per service. Tabs stay logged in according to each provider's session rules. Sessions can expire and require sign-in again.
+## Important compatibility boundary
 
-## Behavior
+Providers may reject embedded browsers at sign-in or during anti-bot checks. Google OAuth in particular restricts embedded authorization. Persistent storage preserves sessions after successful sign-in; it cannot override a provider's sign-in policy or session expiry. This app does not disguise WebKit, copy browser cookies, or bypass authentication restrictions. If a provider blocks embedded sign-in, that service will not work in this version. Real authenticated ChatGPT/Gemini/Claude sessions have not been verified by the build service.
 
-- ChatGPT and Gemini are selected initially; Claude is optional.
-- Requests are dispatched to each selected service in quick succession. Their generation runs concurrently. Dispatch is not an atomic operation; a service can succeed while another fails.
-- Live replies are refreshed every two seconds, and monitoring ends when the response is stable for several checks or after three minutes. Check Chrome for the final authoritative response, especially for long reasoning tasks.
-- **Stop monitoring** lets you send again. It does not cancel generation in Chrome; stop that in the service first.
-- Existing browser drafts are protected. Clear a draft in Chrome before sending from the app.
-- If the send button cannot be found, the filled prompt remains in Chrome for you to send manually. Do not resend blindly: check Chrome to avoid duplicate submissions.
-- **Export comparison** writes the last submitted prompt and visible replies to a local text file.
-- Pick the model and start a fresh chat in each service's Chrome tab when needed, then reconnect. Existing conversations retain their individual context; identical prompts do not make those contexts identical.
+Website editors and send-button selectors are not stable public APIs. If a layout changes, the shared prompt may fail while direct interaction with the page still works. A failed send shows an error above its panel. Existing drafts are preserved, and a prompt is never automatically submitted twice. Send requests are independent; one provider can succeed while another fails.
 
-## Privacy
+## Tests and build
 
-The app communicates only with local Chrome through Apple Events. Chrome sends prompts to the selected providers through their normal websites. There is no analytics, backend, password collection, cookie copying, or additional prompt storage. Exporting creates an unencrypted text file you choose. Chrome Automation permission allows broad browser access; enable it only for software you trust. Adapters verify the exact provider host before inspecting or modifying a page and never script sign-in pages.
+`node Tests/adapters.test.cjs` checks routing, existing drafts, changed drafts, multiline text, busy states, delayed buttons, and exactly-once submission. The macOS workflow builds ARM64, verifies the signature, submits the same prompt through two real WKWebView instances using local HTML fixtures, checks each was submitted once, and relaunches the process to verify a persistent test cookie survived. A fixture-only UI preview is included with build artifacts. Tests do not sign into real accounts.
 
-## Validation and limitations
-
-JavaScript adapter tests run in a simulated DOM with Node (`node Tests/adapters.test.cjs`). These test routing, draft protection, editor input, reading, and disabled send buttons. This source was produced on Linux: the macOS compile, Apple Events permission flow, real provider DOMs, sign-in, and end-to-end response rendering have NOT been verified on a Mac. Do not treat this package as a tested production release.
-
-Provider HTML is not a supported API and may change, vary by account, or differ with language. The app fails visibly when its known controls are unavailable. Update `Sources/adapter.js` and `Sources/send.js` selectors and rerun the installer if needed. The adapters currently target English send-button labels. Responses are plain text, without images, rich Markdown, citations as clickable links, file uploads, or automatic model selection. Subscription limits and availability still apply.
-
-If macOS reports a compiler error, copy the complete output for troubleshooting. Uninstall by deleting the app; this does not remove your Chrome sessions or chats.
+`bash Build.command` produces an app, DMG, and ZIP on a Mac with Apple Command Line Tools. `Install.command` is an optional local source build installer; it is not required when using the DMG.

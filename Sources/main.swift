@@ -1,202 +1,308 @@
 import Cocoa
+import WebKit
 
 struct Provider {
     let id: String
     let name: String
-    let url: String
+    let host: String
+    let home: String
 }
-let providers = [Provider(id: "chatgpt", name: "ChatGPT", url: "https://chatgpt.com/"), Provider(id: "gemini", name: "Gemini", url: "https://gemini.google.com/app"), Provider(id: "claude", name: "Claude", url: "https://claude.ai/new")]
-func literal(_ s: String) -> String { String(data: try! JSONSerialization.data(withJSONObject: s, options: [.fragmentsAllowed]), encoding: .utf8)! }
-func appleLiteral(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r") + "\"" }
+let providers = [
+    Provider(id: "chatgpt", name: "ChatGPT", host: "chatgpt.com", home: "https://chatgpt.com/"),
+    Provider(id: "gemini", name: "Gemini", host: "gemini.google.com", home: "https://gemini.google.com/app"),
+    Provider(id: "claude", name: "Claude", host: "claude.ai", home: "https://claude.ai/new")
+]
+func jsonLiteral(_ value: String) -> String {
+    String(data: try! JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed]), encoding: .utf8)!
+}
+let testing = CommandLine.arguments.contains("--integration-test")
+let restoring = CommandLine.arguments.contains("--verify-persistence")
+
+final class Fixture: NSObject, WKURLSchemeHandler {
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        let html = """
+        <!doctype html><html><head><meta name="viewport" content="width=device-width"><style>
+        body{font:16px -apple-system;padding:24px;color:#243244;background:#f6f8fb}h2{font-size:25px}
+        textarea{width:90%;height:150px;padding:12px;font:16px -apple-system}button{margin-top:16px;padding:12px}
+        </style></head><body><h2>Embedded session test</h2><p>Local fixture — no account or AI service is contacted.</p>
+        <textarea id="prompt-textarea" role="textbox"></textarea><br>
+        <button data-testid="send-button" aria-label="Send message" class="send-button" onclick="document.getElementById('reply').textContent=document.querySelector('textarea').value; window.sentCount=(window.sentCount||0)+1; document.querySelector('textarea').value=''">Send</button>
+        <p id="reply"></p></body></html>
+        """
+        let data = Data(html.utf8)
+        urlSchemeTask.didReceive(URLResponse(url: urlSchemeTask.request.url!, mimeType: "text/html", expectedContentLength: data.count, textEncodingName: "utf-8"))
+        urlSchemeTask.didReceive(data); urlSchemeTask.didFinish()
+    }
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+}
+
+final class Popup: NSObject, NSWindowDelegate {
+    let window: NSWindow
+    let webView: WKWebView
+    var onClose: (() -> Void)?
+    var observation: NSKeyValueObservation?
+    init(configuration: WKWebViewConfiguration, delegate: Pane) {
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 780), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        super.init()
+        window.isReleasedWhenClosed = false; window.delegate = self
+        window.title = "AI Compare — sign in / linked page"
+        window.contentView = webView; webView.uiDelegate = delegate; webView.navigationDelegate = delegate
+        observation = webView.observe(\.url, options: [.new]) { [weak self] view, _ in
+            self?.window.title = "AI Compare — " + (view.url?.host ?? "Sign in")
+        }
+        window.center(); window.makeKeyAndOrderFront(nil)
+    }
+    func windowWillClose(_ notification: Notification) { onClose?() }
+}
+
+final class Pane: NSObject, WKNavigationDelegate, WKUIDelegate {
+    let provider: Provider
+    let view = NSStackView()
+    let webView: WKWebView
+    let include: NSButton
+    let status = NSTextField(labelWithString: "Loading…")
+    let address = NSTextField(labelWithString: "")
+    var popups: [Popup] = []
+    var didLoad: (() -> Void)?
+    private var observation: NSKeyValueObservation?
+    init(_ provider: Provider) {
+        self.provider = provider
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        if testing || restoring { configuration.setURLSchemeHandler(Fixture(), forURLScheme: "aicompare-test") }
+        webView = WKWebView(frame: .zero, configuration: configuration)
+        include = NSButton(checkboxWithTitle: provider.name, target: nil, action: nil)
+        super.init()
+        webView.navigationDelegate = self; webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+        view.orientation = .vertical; view.alignment = .leading; view.spacing = 8
+        include.state = .on; include.font = .boldSystemFont(ofSize: 15)
+        let toolbar = NSStackView(views: [include, NSButton(title: "←", target: self, action: #selector(back)), NSButton(title: "Reload", target: self, action: #selector(reload)), NSButton(title: "Home", target: self, action: #selector(home))])
+        toolbar.orientation = .horizontal; toolbar.spacing = 6
+        view.addArrangedSubview(toolbar)
+        address.font = .systemFont(ofSize: 11); address.textColor = .secondaryLabelColor; address.lineBreakMode = .byTruncatingMiddle
+        status.font = .systemFont(ofSize: 12); status.lineBreakMode = .byTruncatingTail
+        view.addArrangedSubview(address); view.addArrangedSubview(status); view.addArrangedSubview(webView)
+        for child in [address, status, webView] as [NSView] { child.widthAnchor.constraint(equalTo: view.widthAnchor).isActive = true }
+        webView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280).isActive = true
+        observation = webView.observe(\.url, options: [.new]) { [weak self] page, _ in
+            guard let self = self else { return }
+            self.address.stringValue = page.url?.host ?? self.provider.host
+            self.address.toolTip = page.url?.absoluteString
+            if let url = page.url, url.scheme == "https", url.host == self.provider.host {
+                UserDefaults.standard.set(url.absoluteString, forKey: "lastURL." + self.provider.id)
+            }
+        }
+    }
+    func start() {
+        if testing || restoring { webView.load(URLRequest(url: URL(string: "aicompare-test://\(provider.host)/")!)); return }
+        let saved = UserDefaults.standard.string(forKey: "lastURL." + provider.id).flatMap(URL.init(string:))
+        let url = saved?.scheme == "https" && saved?.host == provider.host ? saved! : URL(string: provider.home)!
+        webView.load(URLRequest(url: url))
+    }
+    func message(_ text: String, error: Bool = false) {
+        status.stringValue = text; status.toolTip = text; status.textColor = error ? .systemRed : .secondaryLabelColor
+    }
+    @objc func home() { webView.load(URLRequest(url: URL(string: provider.home)!)) }
+    @objc func back() { webView.goBack() }
+    @objc func reload() { webView.reload() }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        if webView === self.webView { message("Loading…") }
+    }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if webView === self.webView { message("Page loaded • sign in here if needed"); didLoad?() }
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { fail(error) }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { fail(error) }
+    private func fail(_ error: Error) {
+        guard (error as NSError).code != NSURLErrorCancelled else { return }
+        message(error.localizedDescription, error: true)
+    }
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { message("Page process stopped. Click Reload.", error: true) }
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let scheme = navigationAction.request.url?.scheme ?? ""
+        let allowed = ["https", "http", "about", "blob"].contains(scheme) || ((testing || restoring) && scheme == "aicompare-test")
+        if !allowed { message("This link requires an external application and was not opened.", error: true) }
+        decisionHandler(allowed ? .allow : .cancel)
+    }
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard navigationAction.targetFrame == nil else { return nil }
+        let popup = Popup(configuration: configuration, delegate: self)
+        popups.append(popup)
+        popup.onClose = { [weak self, weak popup] in self?.popups.removeAll { $0 === popup } }
+        return popup.webView
+    }
+    func webViewDidClose(_ webView: WKWebView) { popups.first { $0.webView === webView }?.window.close() }
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+        let alert = NSAlert(); alert.messageText = frame.request.url?.host ?? provider.name; alert.informativeText = message; alert.runModal(); completionHandler()
+    }
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        let alert = NSAlert(); alert.messageText = frame.request.url?.host ?? provider.name; alert.informativeText = message; alert.addButton(withTitle: "OK"); alert.addButton(withTitle: "Cancel"); completionHandler(alert.runModal() == .alertFirstButtonReturn)
+    }
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel(); panel.allowsMultipleSelection = parameters.allowsMultipleSelection; panel.canChooseDirectories = parameters.allowsDirectories
+        completionHandler(panel.runModal() == .OK ? panel.urls : nil)
+    }
+    func run(_ action: String, prompt: String, token: String, completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        do {
+            let url = Bundle.main.url(forResource: "adapter", withExtension: "js")!
+            let source = try String(contentsOf: url, encoding: .utf8)
+            // Arguments are passed as values, never interpolated into executable JavaScript.
+            webView.callAsyncJavaScript(source, arguments: ["provider": provider.id, "action": action, "prompt": prompt, "token": token], in: nil, contentWorld: .page) { result in
+                switch result {
+                case .success(let value):
+                    if let response = value as? [String: Any] {
+                        if let message = response["error"] as? String { completion(.failure(NSError(domain: "AICompare", code: 1, userInfo: [NSLocalizedDescriptionKey: message]))) }
+                        else { completion(.success(response)) }
+                    } else { completion(.failure(NSError(domain: "AICompare", code: 2, userInfo: [NSLocalizedDescriptionKey: "The page returned an unexpected result."]))) }
+                case .failure(let error): completion(.failure(error))
+                }
+            }
+        } catch { completion(.failure(error)) }
+    }
+    func send(_ text: String, token: String, completion: @escaping (Bool) -> Void) {
+        message("Preparing prompt…")
+        run("prepare", prompt: text, token: token) { result in
+            switch result {
+            case .failure(let error): self.message(error.localizedDescription, error: true); completion(false)
+            case .success: self.submit(text, token: token, attempts: 12, completion: completion)
+            }
+        }
+    }
+    private func submit(_ text: String, token: String, attempts: Int, completion: @escaping (Bool) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            self.run("send", prompt: text, token: token) { result in
+                switch result {
+                case .failure(let error): self.message(error.localizedDescription, error: true); completion(false)
+                case .success(let response):
+                    if response["sent"] as? Bool == true { self.message("Sent • response appears below"); completion(true) }
+                    else if attempts > 1 { self.submit(text, token: token, attempts: attempts - 1, completion: completion) }
+                    else { self.message("Prompt filled. Send button unavailable; submit it in this panel.", error: true); completion(false) }
+                }
+            }
+        }
+    }
+}
 
 final class App: NSObject, NSApplicationDelegate {
     var window: NSWindow!
-    var prompt = NSTextView()
-    var outputs: [NSTextView] = []
-    var toggles: [NSButton] = []
-    var labels: [NSTextField] = []
-    var sendButton: NSButton!
-    var tabIDs: [String: Int] = [:]
-    var pending = Set<Int>()
-    var baselines: [Int: String] = [:]
-    var baselineCounts: [Int: Int] = [:]
-    var deadlines: [Int: Date] = [:]
-    var timer: Timer?
-    var dispatching = false
-    var polling = false
-    var generation = 0
-    var lastPrompt = ""
-    var lastTexts: [Int: String] = [:]
-    var stableCounts: [Int: Int] = [:]
-    let worker = DispatchQueue(label: "AICompare.browser")
-
+    let prompt = NSTextView()
+    var panes: [Pane] = []
+    let sendButton = NSButton(title: "Send to both AIs", target: nil, action: nil)
+    let summary = NSTextField(labelWithString: "Sign in once in each panel. Your sessions are saved on this Mac.")
+    let showClaude = NSButton(checkboxWithTitle: "Show Claude", target: nil, action: nil)
+    var sending = false
+    var loaded = Set<String>()
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let menu = NSMenu(); let root = NSMenuItem(); menu.addItem(root)
-        let appMenu = NSMenu(); appMenu.addItem(withTitle: "Quit AI Compare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); root.submenu = appMenu
-        let editRoot = NSMenuItem(); menu.addItem(editRoot); let edit = NSMenu(title: "Edit"); editRoot.submenu = edit
-        for (name, action, key) in [("Copy", "copy:", "c"),("Paste", "paste:", "v"),("Cut", "cut:", "x"),("Select All", "selectAll:", "a"),("Undo", "undo:", "z")] { edit.addItem(withTitle:name, action:Selector(action), keyEquivalent:key) }
+        setupMenu()
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1380, height: 900), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "AI Compare • In-app sessions"; window.minSize = NSSize(width: 1000, height: 650); window.isReleasedWhenClosed = false
+        let root = NSView(); window.contentView = root
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10; stack.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(stack)
+        NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16), stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)])
+        let title = NSTextField(labelWithString: "One prompt. Side by side."); title.font = .boldSystemFont(ofSize: 23)
+        let header = NSStackView(views: [title, NSView(), showClaude]); header.orientation = .horizontal
+        showClaude.target = self; showClaude.action = #selector(toggleClaude)
+        showClaude.state = UserDefaults.standard.bool(forKey: "showClaude") ? .on : .off
+        stack.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        summary.font = .systemFont(ofSize: 12); summary.textColor = .secondaryLabelColor; stack.addArrangedSubview(summary)
+        let columns = NSStackView(); columns.orientation = .horizontal; columns.distribution = .fillEqually; columns.spacing = 12; columns.detachesHiddenViews = true
+        for provider in providers {
+            let pane = Pane(provider); panes.append(pane); columns.addArrangedSubview(pane.view)
+            pane.didLoad = { [weak self] in self?.pageLoaded(provider.id) }
+        }
+        panes[2].view.isHidden = showClaude.state != .on
+        stack.addArrangedSubview(columns); columns.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        columns.setContentHuggingPriority(.defaultLow, for: .vertical)
+        let label = NSTextField(labelWithString: "Shared prompt"); label.font = .boldSystemFont(ofSize: 13); stack.addArrangedSubview(label)
+        let scroll = NSScrollView(); scroll.borderType = .bezelBorder; scroll.hasVerticalScroller = true
+        prompt.font = .systemFont(ofSize: 15); prompt.isRichText = false; prompt.allowsUndo = true; prompt.textContainerInset = NSSize(width: 10, height: 10)
+        prompt.minSize = .zero; prompt.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        prompt.isVerticallyResizable = true; prompt.isHorizontallyResizable = false; prompt.autoresizingMask = [.width]; prompt.textContainer?.widthTracksTextView = true
+        scroll.documentView = prompt; stack.addArrangedSubview(scroll)
+        scroll.heightAnchor.constraint(equalToConstant: 94).isActive = true; scroll.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        sendButton.target = self; sendButton.action = #selector(send); sendButton.bezelStyle = .rounded; sendButton.keyEquivalent = "\r"; sendButton.keyEquivalentModifierMask = [.command]
+        let hint = NSTextField(labelWithString: "⌘ Return to send • Use each panel to choose its model or start a new chat"); hint.textColor = .secondaryLabelColor; hint.font = .systemFont(ofSize: 11)
+        let footer = NSStackView(views: [sendButton, hint]); footer.spacing = 12; stack.addArrangedSubview(footer)
+        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        for pane in panes.prefix(showClaude.state == .on ? 3 : 2) { pane.start() }
+        if testing || restoring { DispatchQueue.main.asyncAfter(deadline: .now() + 25) { print("Integration test timed out"); exit(1) } }
+    }
+    func setupMenu() {
+        let menu = NSMenu(); let appItem = NSMenuItem(); menu.addItem(appItem); let appMenu = NSMenu(); appItem.submenu = appMenu
+        appMenu.addItem(withTitle: "About AI Compare", action: #selector(about), keyEquivalent: "")
+        appMenu.addItem(withTitle: "Quit AI Compare", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let editItem = NSMenuItem(); menu.addItem(editItem); let edit = NSMenu(title: "Edit"); editItem.submenu = edit
+        for (title, action, key) in [("Undo", "undo:", "z"), ("Cut", "cut:", "x"), ("Copy", "copy:", "c"), ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")] { edit.addItem(withTitle: title, action: Selector(action), keyEquivalent: key) }
         NSApp.mainMenu = menu
-        window = NSWindow(contentRect: NSRect(x:0,y:0,width:1180,height:780), styleMask:[.titled,.closable,.miniaturizable,.resizable], backing:.buffered, defer:false)
-        window.title = "AI Compare"; window.minSize = NSSize(width:850,height:620)
-        let stack = NSStackView(); stack.orientation = .vertical; stack.spacing = 12; stack.edgeInsets = NSEdgeInsets(top:18,left:18,bottom:18,right:18)
-        window.contentView = stack
-        let title = NSTextField(labelWithString:"One prompt. Multiple perspectives."); title.font = .boldSystemFont(ofSize:24); stack.addArrangedSubview(title)
-        let note = NSTextField(wrappingLabelWithString:"1. Open sessions and sign in using Chrome.  2. In Chrome: View → Developer → Allow JavaScript from Apple Events.  3. Send a shared prompt. Logins stay in your Chrome profile.")
-        stack.addArrangedSubview(note)
-        let tools = NSStackView(); tools.orientation = .horizontal
-        tools.addArrangedSubview(NSButton(title:"Open / reconnect sessions", target:self, action:#selector(openSessions)))
-        tools.addArrangedSubview(NSButton(title:"Stop monitoring", target:self, action:#selector(stopMonitoring)))
-        tools.addArrangedSubview(NSButton(title:"Export comparison…", target:self, action:#selector(exportComparison)))
-        stack.addArrangedSubview(tools)
-        let columns = NSStackView(); columns.orientation = .horizontal; columns.distribution = .fillEqually; columns.spacing = 12
-        for (i,p) in providers.enumerated() {
-            let column = NSStackView(); column.orientation = .vertical; column.spacing = 8
-            let toggle = NSButton(checkboxWithTitle:p.name,target:nil,action:nil); toggle.state = i < 2 ? .on : .off; toggles.append(toggle); column.addArrangedSubview(toggle)
-            let status = NSTextField(labelWithString:"Ready to connect"); status.lineBreakMode = .byTruncatingTail; status.toolTip = "Session status"; labels.append(status); column.addArrangedSubview(status)
-            let view = NSTextView(); view.isEditable = false; view.isRichText = false; view.font = .systemFont(ofSize:14); view.textContainerInset = NSSize(width:12,height:12); outputs.append(view)
-            let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.documentView = view; scroll.borderType = .bezelBorder; configureTextView(view, in: scroll); column.addArrangedSubview(scroll)
-            scroll.widthAnchor.constraint(equalTo:column.widthAnchor).isActive = true
-            columns.addArrangedSubview(column)
-        }
-        stack.addArrangedSubview(columns)
-        columns.widthAnchor.constraint(equalTo:stack.widthAnchor,constant:-36).isActive = true
-        columns.heightAnchor.constraint(greaterThanOrEqualToConstant:280).isActive = true
-        prompt.font = .systemFont(ofSize:15); prompt.isRichText = false; prompt.allowsUndo = true; prompt.textContainerInset = NSSize(width:10,height:10)
-        let input = NSScrollView(); input.hasVerticalScroller = true; input.borderType = .bezelBorder; input.documentView = prompt; configureTextView(prompt, in: input)
-        stack.addArrangedSubview(input); input.heightAnchor.constraint(equalToConstant:110).isActive = true; input.widthAnchor.constraint(equalTo:columns.widthAnchor).isActive = true
-        sendButton = NSButton(title:"Send to selected AIs",target:self,action:#selector(send)); sendButton.keyEquivalent = "\r"; sendButton.keyEquivalentModifierMask = [.command]; stack.addArrangedSubview(sendButton)
-        window.center(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true)
-        if CommandLine.arguments.contains("--smoke-test") {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                guard self.window.isVisible, self.outputs.count == 3, self.sendButton != nil else { exit(1) }
-                print("AI Compare launch smoke test passed")
-                NSApp.terminate(nil)
-            }
-        }
-        timer = Timer.scheduledTimer(withTimeInterval:2,repeats:true) { [weak self] _ in self?.poll() }
     }
-    func configureTextView(_ view: NSTextView, in scroll: NSScrollView) {
-        view.minSize = NSSize(width: 0, height: 0)
-        view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        view.isVerticallyResizable = true
-        view.isHorizontallyResizable = false
-        view.autoresizingMask = [.width]
-        view.textContainer?.containerSize = NSSize(width: scroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
-        view.textContainer?.widthTracksTextView = true
+    @objc func about() {
+        let alert = NSAlert(); alert.messageText = "AI Compare 0.2 — In-app sessions"
+        alert.informativeText = "Each service runs inside this app. Cookies and website storage are saved locally. Sign-in popups also stay inside the app. Providers may expire sessions or reject embedded sign-in; this app cannot override those restrictions. No external browser, API keys, or extra AI subscription is used."
+        alert.runModal()
     }
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
-    func script(_ source: String) throws -> String {
-        var error: NSDictionary?
-        guard let script = NSAppleScript(source:source) else { throw NSError(domain:"Script",code:1,userInfo:[NSLocalizedDescriptionKey:"Invalid browser script"]) }
-        let result = script.executeAndReturnError(&error)
-        if let error = error { throw NSError(domain:"Chrome",code:1,userInfo:[NSLocalizedDescriptionKey:error[NSAppleScript.errorMessage] as? String ?? "Allow Chrome Automation in System Settings → Privacy & Security → Automation."]) }
-        return result.stringValue ?? ""
-    }
-    func connect(_ p: Provider) throws -> Int {
-        let result = try script("""
-        tell application "Google Chrome"
-            if (count of windows) is 0 then make new window
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if URL of t starts with \(appleLiteral(p.url.components(separatedBy:"/").prefix(3).joined(separator:"/") + "/")) then return (id of t) as text
-                end repeat
-            end repeat
-            tell front window
-                set t to make new tab with properties {URL:\(appleLiteral(p.url))}
-                return (id of t) as text
-            end tell
-        end tell
-        """)
-        guard let id = Int(result) else { throw NSError(domain:"Chrome",code:2,userInfo:[NSLocalizedDescriptionKey:"Cannot identify browser tab"]) }; return id
-    }
-    func evaluate(_ id: Int, _ js: String) throws -> [String: Any] {
-        let result = try script("""
-        tell application "Google Chrome"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if id of t is \(id) then return execute t javascript \(appleLiteral(js))
-                end repeat
-            end repeat
-            error "Session tab closed. Click Open / reconnect sessions."
-        end tell
-        """)
-        guard let data = result.data(using:.utf8), let object = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw NSError(domain:"Adapter",code:3,userInfo:[NSLocalizedDescriptionKey:"Unexpected browser response"]) }
-        if let error = object["error"] as? String { throw NSError(domain:"Adapter",code:4,userInfo:[NSLocalizedDescriptionKey:error]) }; return object
-    }
-    func adapter(_ p: Provider, _ action: String, _ text: String = "", file: String = "adapter") throws -> String {
-        guard let url = Bundle.main.url(forResource:file,withExtension:"js") else { throw NSError(domain:"Resources",code:1,userInfo:[NSLocalizedDescriptionKey:"Missing browser adapter"]) }
-        return try String(contentsOf:url,encoding:.utf8).replacingOccurrences(of:"__PROVIDER__",with:literal(p.id)).replacingOccurrences(of:"__ACTION__",with:literal(action)).replacingOccurrences(of:"__PROMPT__",with:literal(text))
-    }
-    @objc func openSessions() {
-        let selected = providers.indices.filter { toggles[$0].state == .on }
-        worker.async { for i in selected { do { let id = try self.connect(providers[i]); DispatchQueue.main.async { self.tabIDs[providers[i].id] = id; self.labels[i].stringValue = "Connected — sign in in Chrome" } } catch { DispatchQueue.main.async { self.labels[i].stringValue = error.localizedDescription } } } }
+    @objc func toggleClaude() {
+        let show = showClaude.state == .on; panes[2].view.isHidden = !show; UserDefaults.standard.set(show, forKey: "showClaude")
+        if show && panes[2].webView.url == nil { panes[2].start() }
+        sendButton.title = show ? "Send to selected AIs" : "Send to selected AIs"
     }
     @objc func send() {
-        let text = prompt.string.trimmingCharacters(in:.whitespacesAndNewlines)
-        let selected = providers.indices.filter { toggles[$0].state == .on }
-        guard !text.isEmpty, !selected.isEmpty, pending.isEmpty, !dispatching else { return }
-        dispatching = true
-        for i in providers.indices { outputs[i].string = selected.contains(i) ? "Preparing…" : "Not included in this comparison" }
-        sendButton.isEnabled = false
-        generation += 1
-        lastPrompt = text
-        let epoch = generation
-        let knownTabs = tabIDs
-        worker.async {
-            for i in selected {
-                do {
-                    guard let id = knownTabs[providers[i].id] else { throw NSError(domain:"Session",code:1,userInfo:[NSLocalizedDescriptionKey:"Click Open / reconnect sessions first."]) }
-                    let prepared = try self.evaluate(id, self.adapter(providers[i],"prepare",text))
-                    Thread.sleep(forTimeInterval:0.4)
-                    _ = try self.evaluate(id,self.adapter(providers[i],"send",file:"send"))
-                    let before = prepared["before"] as? [String:Any] ?? [:]
-                    DispatchQueue.main.async {
-                        guard self.generation == epoch else { return }
-                        self.lastTexts[i] = ""; self.stableCounts[i] = 0
-                        self.baselines[i] = before["text"] as? String ?? ""; self.baselineCounts[i] = before["count"] as? Int ?? 0
-                        self.pending.insert(i); self.deadlines[i] = Date().addingTimeInterval(180)
-                        self.outputs[i].string = "Waiting for response…"; self.labels[i].stringValue = "Sent — monitoring"
-                    }
-                } catch { DispatchQueue.main.async { guard self.generation == epoch else { return }; self.labels[i].stringValue = "Needs attention"; self.outputs[i].string = error.localizedDescription } }
+        let text = prompt.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selected = panes.filter { !$0.view.isHidden && $0.include.state == .on }
+        guard !sending else { return }
+        guard !text.isEmpty, !selected.isEmpty else { summary.stringValue = "Enter a prompt and select at least one AI."; return }
+        sending = true; sendButton.isEnabled = false; showClaude.isEnabled = false
+        let token = UUID().uuidString; var remaining = selected.count; var successes = 0
+        summary.stringValue = "Sending to \(selected.map { $0.provider.name }.joined(separator: ", "))…"
+        for pane in selected {
+            pane.send(text, token: token) { success in
+                if success { successes += 1 }; remaining -= 1
+                if remaining == 0 {
+                    self.sending = false; self.sendButton.isEnabled = true; self.showClaude.isEnabled = true
+                    self.summary.stringValue = successes == selected.count ? "Sent to all selected AIs. Replies stream directly in each panel." : "Sent to \(successes) of \(selected.count). See the red message above any panel that failed."
+                }
             }
-            DispatchQueue.main.async { self.dispatching = false; self.sendButton.isEnabled = self.pending.isEmpty }
         }
     }
-    func poll() {
-        guard !polling, !pending.isEmpty else { return }; polling = true
-        let current = pending; let ids = tabIDs; let epoch = generation
-        worker.async {
-            for i in current {
-                do {
-                    guard let id = ids[providers[i].id] else { continue }
-                    let response = try self.evaluate(id,self.adapter(providers[i],"read"))
-                    DispatchQueue.main.async {
-                        guard self.generation == epoch, self.pending.contains(i) else { return }
-                        let text = response["text"] as? String ?? ""
-                        let count = response["count"] as? Int ?? 0
-                        if !text.isEmpty && (count > (self.baselineCounts[i] ?? 0) || text != self.baselines[i]) { self.outputs[i].string = text; self.labels[i].stringValue = "Response received — monitoring"
-                            if text == self.lastTexts[i] { self.stableCounts[i, default: 0] += 1 } else { self.stableCounts[i] = 0 }
-                            self.lastTexts[i] = text
-                            if self.stableCounts[i, default: 0] >= 5 { self.pending.remove(i); self.labels[i].stringValue = "Response stable — verify completion in Chrome" }
-                        }
-                        if Date() > (self.deadlines[i] ?? Date()) { self.pending.remove(i); self.labels[i].stringValue = "Monitoring ended — check Chrome for completion" }
-                    }
-                } catch { DispatchQueue.main.async { if self.generation == epoch { self.pending.remove(i); self.labels[i].stringValue = error.localizedDescription } } }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func pageLoaded(_ id: String) {
+        guard testing || restoring else { return }
+        loaded.insert(id); guard loaded.count == 2 else { return }
+        if restoring {
+            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                guard let cookie = cookies.first(where: { $0.name == "AIComparePersistenceTest" && $0.value == "saved" }) else { print("Persistent cookie missing after restart"); exit(1) }
+                WKWebsiteDataStore.default().httpCookieStore.delete(cookie) { print("Persistent cookie survived app restart"); NSApp.terminate(nil) }
             }
-            DispatchQueue.main.async { self.polling = false; self.sendButton.isEnabled = self.pending.isEmpty && !self.dispatching }
+            return
+        }
+        let text = "A shared prompt\nwith quotes: \"hello\" and unicode ✓"
+        prompt.string = text
+        var remaining = 2
+        for pane in panes.prefix(2) {
+            pane.send(text, token: "integration-1") { success in
+                guard success else { print("Embedded send failed: \(pane.status.stringValue)"); exit(1) }
+                pane.webView.evaluateJavaScript("JSON.stringify({text:document.getElementById('reply').textContent,count:window.sentCount})") { value, error in
+                    guard error == nil, let string = value as? String, let data = string.data(using: .utf8), let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any], result["text"] as? String == text, result["count"] as? Int == 1 else { print("Shared prompt mismatch or duplicate send"); exit(1) }
+                    remaining -= 1; if remaining == 0 { self.finishTests() }
+                }
+            }
         }
     }
-    @objc func stopMonitoring() { guard !dispatching else { return }; generation += 1; pending.removeAll(); sendButton.isEnabled = true; for label in labels { label.stringValue = "Monitoring stopped; browser may still be generating" } }
-    @objc func exportComparison() {
-        let panel = NSSavePanel(); panel.nameFieldStringValue = "AI-comparison.txt"
-        if panel.runModal() == .OK, let url = panel.url {
-            let text = "AI Compare — \(Date())\n\nPROMPT\n\(lastPrompt)\n\n" + providers.indices.map { "\(providers[$0].name)\n\(outputs[$0].string)" }.joined(separator:"\n\n--------------------\n\n")
-            do { try text.write(to:url,atomically:true,encoding:.utf8) } catch { let alert = NSAlert(); alert.messageText = "Export failed"; alert.informativeText = error.localizedDescription; alert.runModal() }
+    func finishTests() {
+        // Capture the fixture UI for visual QA; no user account pages are loaded.
+        if let root = window.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            if let png = bitmap.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: "dist/InApp-Preview.png")) }
+        }
+        let cookie = HTTPCookie(properties: [.domain: "session-test.invalid", .path: "/", .name: "AIComparePersistenceTest", .value: "saved", .secure: "TRUE", .expires: Date().addingTimeInterval(3600)])!
+        WKWebsiteDataStore.default().httpCookieStore.setCookie(cookie) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { print("Embedded WebKit shared-prompt integration test passed"); NSApp.terminate(nil) }
         }
     }
 }
 let app = NSApplication.shared
-let delegate = App()
-app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.run()
+let delegate = App(); app.delegate = delegate; app.setActivationPolicy(.regular); app.run()

@@ -16,11 +16,12 @@ jobs:
         run: node Tests/adapters.test.cjs
       - name: Compile, sign, and package
         run: bash Build.command
-      - name: Launch native app smoke test
+      - name: Embedded sessions and persistence integration tests
         run: |
           python3 - <<'PYTEST'
           import subprocess
-          subprocess.run(['dist/AI Compare.app/Contents/MacOS/AICompare', '--smoke-test'], check=True, timeout=30)
+          subprocess.run(['dist/AI Compare.app/Contents/MacOS/AICompare', '--integration-test'], check=True, timeout=45)
+          subprocess.run(['dist/AI Compare.app/Contents/MacOS/AICompare', '--verify-persistence'], check=True, timeout=45)
           PYTEST
       - uses: actions/upload-artifact@v4
         with:
@@ -28,4 +29,5 @@ jobs:
           path: |
             dist/AICompare-AppleSilicon.dmg
             dist/AICompare-AppleSilicon.zip
+            dist/InApp-Preview.png
           if-no-files-found: error
