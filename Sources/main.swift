@@ -200,7 +200,7 @@ final class App: NSObject, NSApplicationDelegate {
         setupMenu()
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1380, height: 900), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "AI Compare • In-app sessions"; window.minSize = NSSize(width: 1000, height: 650); window.isReleasedWhenClosed = false
-        let root = NSView(); window.contentView = root
+        let root = NSView(); root.wantsLayer = true; root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor; window.contentView = root
         let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10; stack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(stack)
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 18), stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -18), stack.topAnchor.constraint(equalTo: root.topAnchor, constant: 16), stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)])
@@ -293,11 +293,34 @@ final class App: NSObject, NSApplicationDelegate {
         }
     }
     func finishTests() {
-        // Capture the fixture UI for visual QA; no user account pages are loaded.
-        if let root = window.contentView, let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
-            root.cacheDisplay(in: root.bounds, to: bitmap)
-            if let png = bitmap.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: "dist/InApp-Preview.png")) }
+        // WebKit renders out of process; use its snapshot API for the panel content.
+        guard let root = window.contentView else { exit(1) }
+        var captures: [(NSImage, NSRect)] = []
+        var left = 2
+        for pane in panes.prefix(2) {
+            pane.webView.takeSnapshot(with: nil) { image, error in
+                guard let image = image, error == nil else { print("WebKit snapshot failed"); exit(1) }
+                captures.append((image, pane.webView.convert(pane.webView.bounds, to: root)))
+                left -= 1
+                if left == 0 {
+                    let composite = NSImage(size: root.bounds.size)
+                    composite.lockFocus()
+                    NSColor.windowBackgroundColor.setFill(); root.bounds.fill()
+                    if let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) {
+                        root.cacheDisplay(in: root.bounds, to: bitmap)
+                        bitmap.draw(in: root.bounds)
+                    }
+                    for (image, rect) in captures { image.draw(in: rect) }
+                    composite.unlockFocus()
+                    if let tiff = composite.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) {
+                        try? png.write(to: URL(fileURLWithPath: "dist/InApp-Preview.png"))
+                    }
+                    self.persistTestCookie()
+                }
+            }
         }
+    }
+    func persistTestCookie() {
         let cookie = HTTPCookie(properties: [.domain: "session-test.invalid", .path: "/", .name: "AIComparePersistenceTest", .value: "saved", .secure: "TRUE", .expires: Date().addingTimeInterval(3600)])!
         WKWebsiteDataStore.default().httpCookieStore.setCookie(cookie) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { print("Embedded WebKit shared-prompt integration test passed"); NSApp.terminate(nil) }
