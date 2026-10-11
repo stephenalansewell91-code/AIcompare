@@ -1,0 +1,33 @@
+name: Build Apple Silicon app
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Adapter checks
+        run: node Tests/adapters.test.cjs
+      - name: Compile, sign, and package
+        run: bash Build.command
+      - name: Embedded sessions and persistence integration tests
+        run: |
+          python3 - <<'PYTEST'
+          import subprocess
+          subprocess.run(['dist/AI Compare.app/Contents/MacOS/AICompare', '--integration-test'], check=True, timeout=45)
+          subprocess.run(['dist/AI Compare.app/Contents/MacOS/AICompare', '--verify-persistence'], check=True, timeout=45)
+          PYTEST
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AICompare-AppleSilicon
+          path: |
+            dist/AICompare-AppleSilicon.dmg
+            dist/AICompare-AppleSilicon.zip
+            dist/InApp-Preview.png
+          if-no-files-found: error
