@@ -151,7 +151,7 @@ final class Pane: NSObject, WKNavigationDelegate, WKUIDelegate {
             let url = Bundle.main.url(forResource: "adapter", withExtension: "js")!
             let source = try String(contentsOf: url, encoding: .utf8)
             // Arguments are passed as values, never interpolated into executable JavaScript.
-            webView.callAsyncJavaScript(source, arguments: ["provider": provider.id, "action": action, "prompt": prompt, "token": token], in: nil, contentWorld: .page) { result in
+            webView.callAsyncJavaScript(source, arguments: ["provider": provider.id, "action": action, "prompt": prompt, "token": token], in: nil, in: .page) { result in
                 switch result {
                 case .success(let value):
                     if let response = value as? [String: Any] {
